@@ -1,0 +1,19 @@
+# Core
+fastapi
+uvicorn
+cassandra-driver
+pydantic
+
+# Redis + Rate limiting
+redis
+slowapi
+
+# GeoIP
+geoip2
+
+# Env
+python-dotenv
+
+# Testing
+pytest
+httpx
