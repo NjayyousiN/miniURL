@@ -12,9 +12,15 @@ services:
     container_name: cassandra
     ports:
       - "9042:9042"
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     environment:
       - CASSANDRA_CLUSTER_NAME=MyCluster
       - CASSANDRA_START_RPC=true
+    
     volumes:
       - cassandra-data:/var/lib/cassandra
 
@@ -23,6 +29,8 @@ services:
       context: ./app
       dockerfile: Dockerfile
     container_name: fastapi-app
+    environment:
+      - ./app/.env
     depends_on:
       - redis
       - cassandra

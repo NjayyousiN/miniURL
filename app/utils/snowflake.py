@@ -6,10 +6,12 @@ class SnowflakeIDGenerator:
     def __init__(self, node_id, epoch=1609459200000):
         """
         Snowflake ID Generator
+        This class generates unique 64-bit IDs based on the Snowflake algorithm.
 
         :param node_id: A unique identifier for the node (usually between 0 and 1023).
         :param epoch: A custom epoch to start counting from (in milliseconds).
         """
+
         self.node_id = node_id
         self.epoch = epoch
         self.sequence = 0
