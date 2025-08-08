@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     EPOCH: int
     KEYSPACE: str
     CASSANDRA_HOST: str
+    CASSANDRA_CLIENT_ID: str
+    CASSANDRA_CLIENT_SECRET: str
+    CASSANDRA_SECURE_CONNECT_BUNDLE: str
 
     class Config:
         env_file = ".env"

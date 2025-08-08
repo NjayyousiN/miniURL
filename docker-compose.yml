@@ -1,29 +1,6 @@
 version: "3.8"
 
 services:
-  redis:
-    image: redis:7
-    container_name: redis
-    ports:
-      - "6379:6379"
-
-  cassandra:
-    image: cassandra:4.1
-    container_name: cassandra
-    ports:
-      - "9042:9042"
-    healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    environment:
-      - CASSANDRA_CLUSTER_NAME=MyCluster
-      - CASSANDRA_START_RPC=true
-    
-    volumes:
-      - cassandra-data:/var/lib/cassandra
-
   app:
     build:
       context: ./app
@@ -31,13 +8,7 @@ services:
     container_name: fastapi-app
     environment:
       - ./app/.env
-    depends_on:
-      - redis
-      - cassandra
     volumes:
       - ./app:/app
     ports:
       - "8000:8000"
-
-volumes:
-  cassandra-data:

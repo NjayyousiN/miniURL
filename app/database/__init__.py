@@ -4,6 +4,7 @@ from time import sleep
 from uuid import uuid4
 
 from cassandra.cluster import Cluster
+from cassandra.auth import PlainTextAuthProvider
 from cassandra.policies import RoundRobinPolicy
 from cassandra.cqlengine import columns
 from cassandra.cqlengine.models import Model
@@ -39,9 +40,9 @@ def init_db():
     This function is called to ensure that the URL model is created in the database.
     """
 
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     MAX_RETRIES = 10
     RETRY_DELAY = 5  # seconds
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.info(
@@ -49,11 +50,21 @@ def init_db():
             )
 
             # Establish a connection to the Cassandra database
+            cloud_config = {
+                "secure_connect_bundle": os.path.join(
+                    BASE_DIR, "secure-connect-url-shortener.zip"
+                )
+            }
+            auth_provider = PlainTextAuthProvider(
+                username=settings.CASSANDRA_CLIENT_ID,
+                password=settings.CASSANDRA_CLIENT_SECRET,
+            )
             cluster = Cluster(
-                contact_points=[settings.CASSANDRA_HOST],
+                cloud=cloud_config,
+                auth_provider=auth_provider,
                 load_balancing_policy=RoundRobinPolicy(),
-                protocol_version=3,
                 idle_heartbeat_interval=3,
+                protocol_version=4,
             )
             session = cluster.connect(settings.KEYSPACE)
             session.row_factory = dict_factory

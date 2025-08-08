@@ -7,7 +7,6 @@ from fastapi import FastAPI, HTTPException, status
 from cassandra.cqlengine import connection
 from fastapi.responses import RedirectResponse
 
-from core.config import settings
 from utils.snowflake import SnowflakeIDGenerator
 from database import init_db
 from database.repo import (
