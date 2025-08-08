@@ -1,12 +1,20 @@
 import os
+import asyncio
+import time
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from cassandra.cqlengine import connection
+from fastapi.responses import RedirectResponse
 
-
+from core.config import settings
 from utils.snowflake import SnowflakeIDGenerator
-from database import URL, init_db
+from database import init_db
+from database.repo import (
+    generate_short_url,
+    generate_short_urls,
+    read_original_url_by_id,
+)
 from services.logger import setup_logger
 
 
@@ -14,7 +22,7 @@ logger = setup_logger()
 
 # Initialize Snowflake ID generator
 node_id = int(os.getenv("NODE_ID", 1))
-epoch = int(os.getenv("EPOCH", 1609459200000))
+epoch = int(os.getenv("EPOCH", 1577836800))
 snowflake_generator = SnowflakeIDGenerator(node_id, epoch)
 
 
@@ -45,39 +53,90 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/")
-async def read_root():
-    return {"message": "Welcome to the miniurl API!"}
+@app.post(
+    "/shorten",
+    status_code=status.HTTP_200_OK,
+    response_model=dict,
+)
+async def create_url(original_url: str):
+    generated_short_url = await asyncio.to_thread(
+        generate_short_url, original_url, snowflake_generator
+    )
+
+    if not generated_short_url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Short url generation failed - please check logs.",
+        )
+
+    return generated_short_url
 
 
-@app.post("/shorten")
-async def create_short_url(original_url: str):
+@app.post(
+    "/shorten-batch",
+    status_code=status.HTTP_200_OK,
+    response_model=dict,
+)
+async def create_urls(original_urls: list[str]):
     """
     Create a shortened URL for the given original URL.
     This endpoint generates a unique short URL using the Snowflake ID generator and stores it in the database.
+
+    Args:
+        original_urls (list[str]): The original url/s the user wants to shorten.
+
+    Returns:
+        generated_short_urls(list[dict]): List of shortened url/s mapped to their respective original url.
     """
 
-    unique_id = snowflake_generator.generate_id()
-    short_url = f"https://miniurl.com/{unique_id}"
-    url = URL(original_url=original_url, short_url=str(unique_id))
-    url.save()
+    start = time.perf_counter()
 
-    if not url:
-        raise HTTPException(status_code=500, detail="Failed to create short URL")
+    generated_short_urls = await asyncio.to_thread(
+        generate_short_urls, original_urls, snowflake_generator
+    )
 
-    return {"short_url": short_url, "original_url": original_url}
+    duration = time.perf_counter() - start
+    logger.info(f"Async route completed in {duration:.4f} seconds")
+
+    if not generated_short_urls:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Short url generation failed - please check logs.",
+        )
+
+    return generated_short_urls
 
 
-@app.get("/{id}")
+@app.post("/shorten-sync", response_model=dict)
+def create_urls_sync(original_urls: list[str]):
+    start = time.perf_counter()
+
+    generated_short_urls = generate_short_urls(original_urls, snowflake_generator)
+
+    duration = time.perf_counter() - start
+    logger.info(f"Sync route completed in {duration:.4f} seconds")
+
+    if not generated_short_urls:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Short url generation failed - please check logs.",
+        )
+
+    return generated_short_urls
+
+
+@app.get("/{id}", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 async def read_url(id: str):
     """
     Retrieve the original URL for a given shortened URL.
     This endpoint looks up the original URL in the database using the provided short URL.
+
+    Args:
+        id (str): Shortened URL ID
     """
 
-    url: URL = URL.get(short_url=id)
-    if url:
-        if not url:
-            raise HTTPException(status_code=404, detail="Short URL not found")
+    original_url = await asyncio.to_thread(read_original_url_by_id, id)
 
-    return {"original_url": url.original_url}
+    if original_url:
+        return RedirectResponse(url=original_url)
+    raise HTTPException(status_code=404, detail="Short URL not found")

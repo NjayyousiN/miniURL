@@ -3,6 +3,7 @@ fastapi
 uvicorn
 cassandra-driver
 pydantic
+pydantic-settings
 
 # Redis + Rate limiting
 redis

@@ -12,9 +12,8 @@ from cassandra.cqlengine import connection
 from cassandra.cluster import NoHostAvailable, ConnectionException
 from cassandra.query import dict_factory
 
+from core.config import settings
 from services.logger import setup_logger
-
-KEYSPACE = os.getenv("KEYSPACE", "miniurl")
 
 # Setup logger
 logger = setup_logger()
@@ -27,7 +26,7 @@ class URL(Model):
     It uses Cassandra's CQL Engine for ORM-like functionality.
     """
 
-    __keyspace__ = KEYSPACE
+    __keyspace__ = settings.KEYSPACE
     id = columns.UUID(default=uuid4)
     original_url = columns.Text(required=True)
     short_url = columns.Text(primary_key=True, required=True)
@@ -51,9 +50,12 @@ def init_db():
 
             # Establish a connection to the Cassandra database
             cluster = Cluster(
-                contact_points=["cassandra"], load_balancing_policy=RoundRobinPolicy()
+                contact_points=[settings.CASSANDRA_HOST],
+                load_balancing_policy=RoundRobinPolicy(),
+                protocol_version=3,
+                idle_heartbeat_interval=3,
             )
-            session = cluster.connect(KEYSPACE)
+            session = cluster.connect(settings.KEYSPACE)
             session.row_factory = dict_factory
 
             # Set the session for the Cassandra CQL Engine
