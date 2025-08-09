@@ -40,7 +40,6 @@ from services.logger import setup_logger
 from core.config import settings
 from utils.snowflake import SnowflakeIDGenerator
 from database import connect_to_db, connect_to_redis, get_redis_client
-
 from database.repo import (
     generate_short_url,
     generate_short_urls,
@@ -105,6 +104,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for CORS (For development purposes only)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 
 @app.post(
@@ -315,7 +322,7 @@ async def create_urls(
         },
     },
 )
-async def read_url(
+async def get_url(
     id: str = Path(
         ...,
         description="The unique identifier of the shortened URL (Snowflake ID)",

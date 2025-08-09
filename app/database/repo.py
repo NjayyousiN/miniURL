@@ -46,6 +46,7 @@ from cassandra.cluster import Session
 from cassandra import InvalidRequest
 from redis.exceptions import ResponseError, TimeoutError
 import redis.asyncio as redis
+
 from utils.snowflake import SnowflakeIDGenerator
 from database import URL
 from services.logger import setup_logger
@@ -246,11 +247,7 @@ async def read_original_url_by_id(id: str, redis_client: redis.Redis) -> str:
         original_url = await redis_client.get(id)
         if original_url:
             logger.debug(f"Cache hit for URL ID: {id}")
-            return (
-                original_url.decode("utf-8")
-                if isinstance(original_url, bytes)
-                else original_url
-            )
+            return original_url
 
         # Cache miss - query Cassandra database
         logger.debug(f"Cache miss for URL ID: {id}, querying database")
