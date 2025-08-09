@@ -50,6 +50,7 @@ Dependencies:
 """
 
 import os
+import base64
 from datetime import datetime
 from time import sleep
 from uuid import uuid4
@@ -177,9 +178,15 @@ def connect_to_db() -> None:
         event handler. The connection persists for the application lifetime and
         should be properly closed during shutdown.
     """
+
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_PATH = os.path.join(BASE_DIR, "secure-connect-url-shortener.zip")
     MAX_RETRIES = 10
     RETRY_DELAY = 5  # seconds
+
+    # Ensure secure connect bundle exists
+    with open(BUNDLE_PATH, "wb") as bundle_file:
+        bundle_file.write(base64.b64decode(settings.ASTRA_BUNDLE_B64))
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -187,12 +194,15 @@ def connect_to_db() -> None:
                 f"Attempting to connect to Cassandra (Attempt {attempt}/{MAX_RETRIES})..."
             )
 
-            # Configure secure connection to DataStax Astra DB
-            cloud_config = {
-                "secure_connect_bundle": os.path.join(
-                    BASE_DIR, "secure-connect-url-shortener.zip"
+            # Check if secure connect bundle exists
+            if not os.path.exists(BUNDLE_PATH):
+                logger.error(f"Secure connect bundle not found at {BUNDLE_PATH}")
+                raise FileNotFoundError(
+                    f"Secure connect bundle not found at {BUNDLE_PATH}"
                 )
-            }
+
+            # Configure secure connection to DataStax Astra DB
+            cloud_config = {"secure_connect_bundle": BUNDLE_PATH}
 
             # Setup authentication with client credentials
             auth_provider = PlainTextAuthProvider(
