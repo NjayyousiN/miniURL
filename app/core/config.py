@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     CASSANDRA_HOST: str
     CASSANDRA_CLIENT_ID: str
     CASSANDRA_CLIENT_SECRET: str
-    CASSANDRA_SECURE_CONNECT_BUNDLE: str
+    ASTRA_BUNDLE_B64: str
 
     class Config:
         env_file = ".env"

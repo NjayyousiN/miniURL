@@ -102,6 +102,13 @@ async def lifespan(app: FastAPI):
             detail="Redis connection failed",
         )
 
+    except FileNotFoundError as e:
+        logger.error(f"Secure connect bundle not found: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Secure connect bundle not found",
+        )
+
 
 app = FastAPI(lifespan=lifespan)
 
