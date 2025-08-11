@@ -5,6 +5,15 @@ class Settings(BaseSettings):
     ENV: str
     NODE_ID: int
     EPOCH: int
+    DOMAIN: str
+    GLOBAL_BUCKET_NAME: str
+    GLOBAL_BUCKET_CAPACITY: int
+    GLOBAL_BUCKET_REFILL_RATE: int
+    GLOBAL_BUCKET_REFILL_INTERVAL: int
+    IP_BUCKET_TTL: int
+    IP_BUCKET_CAPACITY: int
+    IP_BUCKET_REFILL_RATE: int
+    IP_BUCKET_REFILL_INTERVAL: int
     KEYSPACE: str
     REDIS_PASSWORD: str
     REDIS_USERNAME: str

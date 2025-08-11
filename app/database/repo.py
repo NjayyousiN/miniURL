@@ -49,6 +49,7 @@ import redis.asyncio as redis
 
 from utils.snowflake import SnowflakeIDGenerator
 from database import URL
+from core.config import settings
 from services.logger import setup_logger
 
 logger = setup_logger()
@@ -102,7 +103,7 @@ async def generate_short_urls(
         for original_url in original_urls:
             # Generate a unique id
             unique_id = snowflake_generator.generate_id()
-            short_url = f"https://miniurl.com/{unique_id}"
+            short_url = f"{settings.DOMAIN}/{unique_id}"
 
             # Add to batch query
             URL.batch(b).create(short_url=str(unique_id), original_url=original_url)
@@ -193,7 +194,7 @@ async def generate_short_url(
 
         return {
             "original_url": original_url,
-            "short_url": f"https://miniurl.com/{unique_id}",
+            "short_url": f"{settings.DOMAIN}/{unique_id}",
         }
 
     except InvalidRequest as e:

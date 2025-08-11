@@ -28,15 +28,17 @@ Dependencies:
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status, Depends, Path, Body, Query
+from fastapi import FastAPI, HTTPException, Request, status, Depends, Path, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from cassandra import InvalidRequest
 from cassandra.cqlengine import connection
-from redis.exceptions import ConnectionError, ResponseError, TimeoutError
+from redis.exceptions import ConnectionError, ResponseError, TimeoutError, WatchError
 import redis.asyncio as redis
 
+from services.rate_limiter import ip_rate_limit_checker
 from services.logger import setup_logger
+from services.tokens_bucket import create_tokens_bucket, update_tokens_bucket
 from core.config import settings
 from utils.snowflake import SnowflakeIDGenerator
 from database import connect_to_db, connect_to_redis, get_redis_client
@@ -80,6 +82,21 @@ async def lifespan(app: FastAPI):
         connect_to_db()
         connect_to_redis()
 
+        app.state.redis = get_redis_client()
+
+        # Use a single time source
+        now_s, _ = await app.state.redis.time()
+
+        # Initialize global API service request limiter
+        await create_tokens_bucket(
+            key=settings.GLOBAL_BUCKET_NAME,
+            mappings={
+                "tokens": settings.GLOBAL_BUCKET_CAPACITY,
+                "last_refill": str(now_s),
+            },
+            is_global=True,
+        )
+
         yield
 
         logger.info("Application is shutting down.")
@@ -108,6 +125,10 @@ async def lifespan(app: FastAPI):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Secure connect bundle not found",
         )
+    except WatchError as e:
+        logger.warning(
+            f"Global bucket initialization failed, watched key is changed: {e}"
+        )
 
 
 app = FastAPI(lifespan=lifespan)
@@ -121,11 +142,49 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def global_rate_limiter(request: Request, call_next):
+    redis_client: redis.Redis = app.state.redis
+
+    global_bucket = await redis_client.hgetall(settings.GLOBAL_BUCKET_NAME)
+
+    now_s, _ = await redis_client.time()
+
+    last_refill = int(global_bucket.get("last_refill"))
+
+    if not global_bucket:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Rate Limiter not configured.",
+        )
+
+    if (
+        now_s - last_refill
+    ) < 1:  # Check if more than 1 second has passed since the last refill. Best practice to avoid too frequent refills.
+        is_updated = await update_tokens_bucket(
+            key=settings.GLOBAL_BUCKET_NAME,
+            tokens=int(global_bucket["tokens"]),
+            last_refill=int(global_bucket["last_refill"]),
+            is_global=True,
+        )
+
+        if not is_updated:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit reached. Please wait for a few seconds before sending other requests (ur killing the server) (:",
+            )
+
+    response = await call_next(request)
+
+    return response
+
+
 @app.post(
     "/shorten",
     status_code=status.HTTP_201_CREATED,
     response_model=dict,
     summary="Create a shortened URL",
+    # dependencies=[Depends(ip_rate_limit_checker)],
     description="""
     Generate a unique shortened URL for a given original URL.
     
@@ -163,6 +222,7 @@ app.add_middleware(
     },
 )
 async def create_url(
+    request: Request,
     original_url: str = Query(
         ..., description="Original URL to be shortened", example="https://example.com"
     ),
@@ -205,6 +265,7 @@ async def create_url(
     status_code=status.HTTP_201_CREATED,
     response_model=dict,
     summary="Create shortened URLs in batch",
+    dependencies=[Depends(ip_rate_limit_checker)],
     description="""
     Generate shortened URLs for multiple original URLs in a single request.
     

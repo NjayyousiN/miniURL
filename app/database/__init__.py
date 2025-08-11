@@ -247,7 +247,7 @@ def connect_to_db() -> None:
     raise RuntimeError("Failed to connect to Cassandra after multiple attempts.")
 
 
-def connect_to_redis() -> None:
+def connect_to_redis() -> redis.Redis:
     """
     Establish connection to Redis server with environment-specific configuration.
 
@@ -342,7 +342,7 @@ def connect_to_redis() -> None:
         )
 
         logger.info("Redis connection established successfully.")
-
+        return redis_client
     except ConnectionError as e:
         logger.error(f"Redis connection failed: {e}")
         raise e
