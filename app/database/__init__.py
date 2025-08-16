@@ -51,7 +51,7 @@ Dependencies:
 
 import os
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from time import sleep
 from uuid import uuid4
 
@@ -125,7 +125,55 @@ class URL(Model):
     id = columns.UUID(default=uuid4)
     original_url = columns.Text(required=True)
     short_url = columns.Text(primary_key=True, required=True)
+    start_date = columns.DateTime(required=True, default=datetime.now)
+    expiry_date = columns.DateTime(required=True)
     created_at = columns.DateTime(default=datetime.now)
+
+
+class Slug(Model):
+    """
+    Cassandra model representing a slug mapping in the miniURL application.
+
+    This model defines the database schema for storing slugs associated with URLs.
+    It uses Cassandra's CQL Engine ORM for type-safe database operations and
+    automatic query generation. The model is optimized for read-heavy workloads
+    typical in URL shortening services.
+
+    Schema Design:
+        - Primary key on slug for fast lookups during redirect operations
+        - Text fields with appropriate sizing for slug storage
+        - Automatic timestamp tracking for analytics and debugging
+
+    Attributes:
+        id (UUID): Unique identifier for each slug record. Auto-generated using UUID4
+                   for distributed uniqueness without coordination.
+        slug (Text): The unique slug identifier. Serves as the primary key for fast lookups.
+        created_at (DateTime): Timestamp when the slug mapping was created. Auto-populated
+                              with current datetime for analytics and debugging.
+
+    Keyspace:
+        Uses the keyspace defined in application settings for multi-tenant support
+        and environment isolation (development/staging/production).
+
+    Performance Considerations:
+        - Primary key on slug enables single-partition reads
+        - Text columns are efficiently stored in Cassandra's SSTable format
+        - DateTime indexing supports time-based queries for analytics
+        - Model supports both single and batch operations
+
+    Example:
+        >>> slug_record = Slug.create(
+        ...     slug="example-slug"
+        ... )
+        >>> # Auto-generates id and created_at fields
+    """
+
+    __keyspace__ = settings.KEYSPACE
+
+    id = columns.UUID(default=uuid4)
+    slug = columns.Text(primary_key=True, required=True)
+    created_at = columns.DateTime(default=datetime.now)
+    expires_at = columns.DateTime(required=True)
 
 
 def connect_to_db() -> None:
@@ -228,6 +276,7 @@ def connect_to_db() -> None:
 
             # Synchronize database schema with application models
             sync_table(URL)
+            sync_table(Slug)
 
             logger.info(
                 "Cassandra connection established and tables are created successfully."
@@ -342,6 +391,7 @@ def connect_to_redis() -> redis.Redis:
         )
 
         logger.info("Redis connection established successfully.")
+
         return redis_client
     except ConnectionError as e:
         logger.error(f"Redis connection failed: {e}")

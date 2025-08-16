@@ -28,27 +28,29 @@ Dependencies:
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, status, Depends, Path, Body, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+
 from cassandra import InvalidRequest
 from cassandra.cqlengine import connection
-from redis.exceptions import ConnectionError, ResponseError, TimeoutError, WatchError
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 import redis.asyncio as redis
+from redis.exceptions import ConnectionError, ResponseError, TimeoutError, WatchError
 
-from services.rate_limiter import ip_rate_limit_checker
-from services.logger import setup_logger
-from services.tokens_bucket import create_tokens_bucket, update_tokens_bucket
 from core.config import settings
-from utils.snowflake import SnowflakeIDGenerator
+from core.exceptions import ExpiredEntryError, LinkNotActiveYetError, SlugAlreadyExistsError
 from database import connect_to_db, connect_to_redis, get_redis_client
 from database.repo import (
     generate_short_url,
     generate_short_urls,
     read_original_url_by_id,
 )
+from database.schema import CreateURL
+from services.logger import setup_logger
+from services.rate_limiter import ip_rate_limit_checker
+from services.tokens_bucket import create_tokens_bucket, update_tokens_bucket
+from utils.snowflake import SnowflakeIDGenerator
 
-# Setup logger
 logger = setup_logger()
 
 # Initialize Snowflake ID generator
@@ -84,6 +86,8 @@ async def lifespan(app: FastAPI):
 
         app.state.redis = get_redis_client()
 
+        # PLEASE REMOVE IT WHEN U DEPLOYYYYYYYYYYYYYYYYYYYYYY
+        await app.state.redis.flushall()
         # Use a single time source
         now_s, _ = await app.state.redis.time()
 
@@ -127,7 +131,7 @@ async def lifespan(app: FastAPI):
         )
     except WatchError as e:
         logger.warning(
-            f"Global bucket initialization failed, watched key is changed: {e}"
+            "Global bucket initialization failed, watched key is changed: %s", e
         )
 
 
@@ -135,22 +139,31 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for CORS (For development purposes only)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 @app.middleware("http")
 async def global_rate_limiter(request: Request, call_next):
+    """Middleware to enforce a global rate limit for all incoming requests.
+
+    This middleware checks and updates a global token bucket stored in Redis to prevent
+    the server from being overwhelmed by too many requests. If the rate limit is
+
+    exceeded, it returns a 429 Too Many Requests error.
+
+    Args:
+        request (Request): The incoming request object.
+        call_next (Callable): The next middleware or endpoint in the request chain.
+
+    Returns:
+        Response: The response from the next middleware or endpoint, or a 429 error.
+    """
     redis_client: redis.Redis = app.state.redis
-
     global_bucket = await redis_client.hgetall(settings.GLOBAL_BUCKET_NAME)
-
-    now_s, _ = await redis_client.time()
-
-    last_refill = int(global_bucket.get("last_refill"))
 
     if not global_bucket:
         raise HTTPException(
@@ -158,9 +171,10 @@ async def global_rate_limiter(request: Request, call_next):
             detail="Rate Limiter not configured.",
         )
 
-    if (
-        now_s - last_refill
-    ) < 1:  # Check if more than 1 second has passed since the last refill. Best practice to avoid too frequent refills.
+    now_s, _ = await redis_client.time()
+    last_refill = int(global_bucket.get("last_refill"))
+
+    if (now_s - last_refill) >= 1:
         is_updated = await update_tokens_bucket(
             key=settings.GLOBAL_BUCKET_NAME,
             tokens=int(global_bucket["tokens"]),
@@ -171,11 +185,13 @@ async def global_rate_limiter(request: Request, call_next):
         if not is_updated:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit reached. Please wait for a few seconds before sending other requests (ur killing the server) (:",
+                detail=(
+                    "Rate limit reached. Please wait for a few seconds before sending"
+                    " other requests. Your killing my server (:"
+                ),
             )
 
     response = await call_next(request)
-
     return response
 
 
@@ -184,7 +200,7 @@ async def global_rate_limiter(request: Request, call_next):
     status_code=status.HTTP_201_CREATED,
     response_model=dict,
     summary="Create a shortened URL",
-    # dependencies=[Depends(ip_rate_limit_checker)],
+    dependencies=[Depends(ip_rate_limit_checker)],
     description="""
     Generate a unique shortened URL for a given original URL.
     
@@ -223,40 +239,43 @@ async def global_rate_limiter(request: Request, call_next):
 )
 async def create_url(
     request: Request,
-    original_url: str = Query(
-        ..., description="Original URL to be shortened", example="https://example.com"
-    ),
+    url_data: CreateURL,
     redis_client: redis.Redis = Depends(get_redis_client),
 ):
-    """
-    Create a shortened URL for a single original URL.
+    """Create a shortened URL for a single original URL.
 
-    This endpoint processes a single URL and returns a shortened version that can be
-    used for sharing, tracking, or space-saving purposes. The original URL must be
-    a valid HTTP/HTTPS URL.
+    This endpoint processes a single URL and returns a shortened version.
 
     Args:
-        original_url (str): The complete URL to be shortened. Must be a valid HTTP/HTTPS URL.
-        redis_client (redis.Redis): Redis client instance for caching (injected dependency).
+        url_data (CreateURL): The request body containing the original URL.
+        redis_client (redis.Redis): Redis client instance for caching.
 
     Returns:
-        dict: A dictionary containing both the original URL and the generated short URL.
-
-    Raises:
-        HTTPException: 500 for database/Redis errors.
+        dict: A dictionary containing the original URL and the generated short URL.
     """
     try:
-        generated_short_url = await generate_short_url(
-            original_url, snowflake_generator, redis_client
+        return await generate_short_url(
+            url_data,
+            snowflake_generator,
+            redis_client,
         )
-
-        return generated_short_url
-
     except (InvalidRequest, ResponseError, TimeoutError) as e:
-        logger.error(f"Short URL generation failed: {e}")
+        logger.error("Short URL generation failed: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Short URL generation failed",
+        )
+    except SlugAlreadyExistsError as e:
+        logger.error("Slug already exists: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except ValueError as e:
+        logger.error("Invalid expiry date provided: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Expiry date must be in the future.",
         )
 
 
@@ -304,45 +323,53 @@ async def create_url(
     },
 )
 async def create_urls(
-    original_urls: list[str] = Body(
+    original_urls: list[dict] = Body(
         ...,
-        description="List of original URLs to be shortened",
-        example=["https://example.com", "https://example2.com", "https://example3.com"],
+        description=(
+            "List of original URLs to be shortened along with optional expiry dates"
+            " and one-time use flags"
+        ),
+        example=[
+            {
+                "original_url": "https://example.com",
+                "expiry_date": "2023-12-31T23:59:59",
+                "start_date": "2023-12-31T23:59:59",
+                "slug": "example",
+            },
+            {
+                "original_url": "https://another-example.com",
+                "expiry_date": "2024-01-15T12:00:00",
+                "start_date": "2023-12-31T23:59:59",
+                "slug": "another-example",
+            },
+        ],
     ),
     redis_client: redis.Redis = Depends(get_redis_client),
 ):
-    """
-    Create shortened URLs for multiple original URLs in a single batch operation.
-
-    This endpoint efficiently processes multiple URLs simultaneously, reducing the
-    number of API calls required for bulk operations. Each URL is validated and
-    processed independently, ensuring that failures in individual URLs don't
-    affect the processing of others in the batch.
+    """Create shortened URLs for multiple original URLs in a single batch operation.
 
     Args:
-        original_urls (list[str]): A list of complete URLs to be shortened. Each URL
-                                 must be a valid HTTP/HTTPS URL.
-        redis_client (redis.Redis): Redis client instance for caching (injected dependency).
+        original_urls (list[dict]): A list of dicts, each containing the URL data.
+        redis_client (redis.Redis): Redis client instance for caching.
 
     Returns:
         dict: A dictionary mapping each generated short URL to its original URL.
-              Only successfully processed URLs are included in the response.
-
-    Raises:
-        HTTPException: 500 for database/Redis errors.
     """
     try:
-        generated_short_urls = await generate_short_urls(
+        return await generate_short_urls(
             original_urls, snowflake_generator, redis_client
         )
-
-        return generated_short_urls
-
     except (InvalidRequest, ResponseError, TimeoutError) as e:
-        logger.error(f"Batch URL generation failed: {e}")
+        logger.error("Batch URL generation failed: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Batch URL generation failed",
+        )
+    except ValueError as e:
+        logger.error("Invalid expiry date provided: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Expiry date must be in the future.",
         )
 
 
@@ -391,45 +418,42 @@ async def create_urls(
     },
 )
 async def get_url(
-    id: str = Path(
+    short_id: str = Path(
         ...,
         description="The unique identifier of the shortened URL (Snowflake ID)",
         example="123456789012345678",
     ),
     redis_client: redis.Redis = Depends(get_redis_client),
 ):
-    """
-    Retrieve and redirect to the original URL for a given shortened URL identifier.
-
-    This endpoint handles the resolution of short URLs back to their original
-    destinations. It implements a fast lookup strategy using Redis cache with
-    Cassandra fallback, ensuring both performance and data persistence.
-
-    The function performs an HTTP 307 temporary redirect, which maintains the
-    original request method and indicates to browsers and crawlers that the
-    redirect is not permanent.
+    """Retrieve and redirect to the original URL for a given shortened URL identifier.
 
     Args:
-        id (str): The unique Snowflake ID representing the shortened URL.
-                 This should be the path segment from the short URL.
-        redis_client (redis.Redis): Redis client instance for caching (injected dependency).
+        short_id (str): The unique ID representing the shortened URL.
+        redis_client (redis.Redis): Redis client instance for caching.
 
     Returns:
         RedirectResponse: HTTP 307 redirect to the original URL.
-
-    Raises:
-        HTTPException: 404 if the short URL is not found, 500 for database/Redis errors.
     """
     try:
-        original_url = await read_original_url_by_id(id, redis_client)
-
+        original_url = await read_original_url_by_id(short_id, redis_client)
         if original_url:
             return RedirectResponse(url=original_url)
         raise HTTPException(status_code=404, detail="Short URL not found")
-
     except (InvalidRequest, ResponseError, TimeoutError) as e:
-        logger.error(f"Error retrieving original URL: {e}")
+        logger.error("Error retrieving original URL: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error retrieving original URL",
+        )
+    except LinkNotActiveYetError as e:
+        logger.warning("Link not active: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        )
+    except ExpiredEntryError as e:
+        logger.warning("Link expired: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
         )

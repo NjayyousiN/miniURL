@@ -40,240 +40,381 @@ Dependencies:
     - database.URL: Cassandra model for URL storage
 """
 
-from cassandra.cqlengine.query import BatchQuery
-from cassandra.cqlengine import connection
-from cassandra.cluster import Session
-from cassandra import InvalidRequest
-from redis.exceptions import ResponseError, TimeoutError
-import redis.asyncio as redis
+import random
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-from utils.snowflake import SnowflakeIDGenerator
-from database import URL
+from cassandra.cluster import Session
+from cassandra.cqlengine import connection
+from cassandra.cqlengine.query import BatchQuery
+from cassandra import InvalidRequest
+import redis.asyncio as redis
+from redis.exceptions import ResponseError, TimeoutError
+
 from core.config import settings
+from core.exceptions import ExpiredEntryError, LinkNotActiveYetError, SlugAlreadyExistsError
+from database import URL
+from database.schema import CreateURL, CreateURLBatch
 from services.logger import setup_logger
+from utils.snowflake import SnowflakeIDGenerator
 
 logger = setup_logger()
 
 
+async def _generate_alternative_slugs(slug: str, redis_client: redis.Redis, session: Session) -> list[str]:
+    """Generate alternative slugs for a given slug.
+
+    Args:
+        slug: The custom slug to generate alternative slugs for.
+
+    Returns:
+        A list of alternative slugs.
+    """
+
+    alternative_slugs = [
+        slug + str(random.randint(100, 999))
+        for _ in range(6)
+    ]
+    available_slugs = []
+    for slug in alternative_slugs:
+        if await _is_slug_available(slug, redis_client, session):
+            available_slugs.append(slug)
+    raise SlugAlreadyExistsError(f"Slug already exists, try one of these: {available_slugs}") from None
+
+
+async def _reserve_slug(
+    slug: str, expires_at: datetime, redis_client: redis.Redis, session: Session
+) -> bool:
+    """Reserve a custom slug in Redis to prevent conflicts.
+
+    Args:
+        slug: The custom slug to reserve.
+        expires_at: The expiry date of the slug.
+        redis_client: Async Redis client.
+        session: Cassandra session.
+
+    Returns:
+        True if the slug was successfully reserved, False otherwise.
+    """
+    try:
+        logger.debug("Reserving slug in Redis: %s", slug)
+        query = session.prepare("INSERT INTO slug (slug, expires_at) VALUES (?, ?)")
+        session.execute_async(query, [slug, expires_at])
+
+        if await redis_client.setnx(f"slug:{slug}", "reserved"):
+            await redis_client.expire(f"slug:{slug}", 60 * 60 * 24)
+            logger.info("Slug '%s' reserved successfully.", slug)
+            return True
+        return False
+    except (ResponseError, TimeoutError) as e:
+        logger.error("Redis operation failed while reserving slug: %s", e)
+        raise
+    except InvalidRequest as e:
+        logger.error("Cassandra operation failed while reserving slug: %s", e)
+        raise
+
+
+async def _is_slug_available(
+    slug: str, redis_client: redis.Redis, session: Session
+) -> bool:
+    """Check if a given slug is available for use.
+
+    Args:
+        slug: The custom slug to check.
+        redis_client: Async Redis client.
+        session: Cassandra session.
+
+    Returns:
+        True if the slug is available, False otherwise.
+    """
+
+    available = False
+    try:
+        logger.debug("Checking availability for slug: %s", slug)
+        if await redis_client.exists(f"slug:{slug}"):
+            logger.debug("Slug '%s' is already in use.", slug)
+            available = False
+
+        query = session.prepare("SELECT * FROM slug WHERE slug=?")
+        future = session.execute_async(query, [slug])
+        available = not future.result()
+
+        if not available:
+            await _generate_alternative_slugs(slug, redis_client, session)
+
+        return available
+
+    except (ResponseError, TimeoutError) as e:
+        logger.error("Redis operation failed while checking slug availability: %s", e)
+        raise
+    except InvalidRequest as e:
+        logger.error(
+            "Cassandra operation failed while checking slug availability: %s", e
+        )
+        raise
+
+
+async def _handle_slug_creation(
+    slug: str,
+    expiry_date: datetime,
+    redis_client: redis.Redis,
+    session: Session,
+) -> str:
+    """Handle the creation and reservation of a custom slug.
+
+    Args:
+        slug: The custom slug to create.
+        expiry_date: The expiry date of the slug.
+        redis_client: Async Redis client.
+        session: Cassandra session.
+
+    Returns:
+        The reserved slug.
+    """
+    if not await _is_slug_available(slug, redis_client, session):
+        logger.error("Slug '%s' is already in use.", slug)
+        raise ValueError(f"Slug '{slug}' is already in use.")
+
+    if not await _reserve_slug(slug, expiry_date, redis_client, session):
+        logger.error("Failed to reserve slug '%s'.", slug)
+        raise ValueError(f"Failed to reserve slug '{slug}'.")
+    return slug
+
+
+async def _cache_url_mapping(
+    key: str,
+    data: dict,
+    expiry_date: datetime,
+    redis_client: redis.Redis,
+):
+    """Cache the URL mapping in Redis.
+
+    Args:
+        key: The key to store the mapping under.
+        data: The URL mapping data.
+        expiry_date: The expiry date of the mapping.
+        redis_client: Async Redis client.
+    """
+    await redis_client.hset(name=key, mapping=data)
+    now_s, _ = await redis_client.time()
+    now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
+    await redis_client.expire(key, int((expiry_date - now).total_seconds()))
+
+
 async def generate_short_urls(
-    original_urls: list[str],
+    batch_urls: CreateURLBatch,
     snowflake_generator: SnowflakeIDGenerator,
     redis_client: redis.Redis,
 ) -> dict:
-    """
-    Generate shortened URLs for multiple original URLs using batch processing.
-
-    This function efficiently creates multiple short URLs in a single database
-    transaction using Cassandra's batch query capabilities. Each URL gets a unique
-    Snowflake ID and is stored in both Cassandra (for persistence) and Redis
-    (for fast access). The batch approach ensures better performance and partial
-    atomicity compared to individual URL creation.
-
-    The function processes all URLs in the batch and caches each one in Redis
-    with a 24-hour expiration time. If any part of the operation fails, the
-    entire batch is rolled back to maintain data consistency.
+    """Generate shortened URLs for multiple original URLs using batch processing.
 
     Args:
-        original_urls (list[str]): List of complete URLs to be shortened. Each URL
-                                 should be a valid HTTP/HTTPS URL.
-        snowflake_generator (SnowflakeIDGenerator): Instance for generating unique
-                                                   distributed IDs.
-        redis_client (redis.Redis): Async Redis client for caching operations.
+        batch_urls: Batch of URLs to be shortened.
+        snowflake_generator: Instance for generating unique distributed IDs.
+        redis_client: Async Redis client for caching operations.
 
     Returns:
-        dict: Dictionary mapping generated short URLs to their original URLs.
-              Format: {"https://miniurl.com/{id}": "https://original-url.com"}
-
-    Raises:
-        InvalidRequest: If the Cassandra batch query fails due to invalid data
-                       or database constraints.
-        ResponseError: If Redis operations fail due to server errors.
-        TimeoutError: If Redis operations exceed the configured timeout.
-
-    Example:
-        >>> urls = ["https://example.com", "https://google.com"]
-        >>> result = await generate_short_urls(urls, generator, redis_client)
-        >>> # Returns: {"https://miniurl.com/123": "https://example.com", ...}
+        Dictionary mapping generated short URLs to their original URLs.
     """
-    generated_short_urls: dict = {}
+    generated_short_urls = {}
+    session: Session = connection.get_session()
+    now_s, _ = await redis_client.time()
+    now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
 
     try:
-        b = BatchQuery()
+        batch = BatchQuery()
+        for entry in batch_urls.urls:
+            expiry_date = entry.expiry_date
+            start_date = entry.start_date
+            slug = entry.slug
 
-        for original_url in original_urls:
-            # Generate a unique id
-            unique_id = snowflake_generator.generate_id()
-            short_url = f"{settings.DOMAIN}/{unique_id}"
+            if slug:
+                key = await _handle_slug_creation(
+                    slug, expiry_date, redis_client, session
+                )
+            else:
+                key = str(snowflake_generator.generate_id())
 
-            # Add to batch query
-            URL.batch(b).create(short_url=str(unique_id), original_url=original_url)
-            generated_short_urls[short_url] = original_url
+            short_url = f"{settings.DOMAIN}/{key}"
+            original_url = entry.original_url
 
-            # Store in Redis with 24-hour expiration
-            await redis_client.set(short_url, original_url, ex=60 * 60 * 24)
+            URL.batch(batch).create(
+                short_url=key,
+                original_url=original_url,
+                expiry_date=expiry_date,
+                start_date=start_date,
+            )
 
-        # Execute batch query atomically
-        b.execute()
+            url_data = {
+                "original_url": original_url,
+                "short_url": short_url,
+                "expiry_date": str(expiry_date),
+                "start_date": str(start_date),
+            }
+            generated_short_urls[short_url] = url_data
+            await _cache_url_mapping(key, url_data, expiry_date, redis_client)
 
+        batch.execute()
         logger.info(
-            f"Successfully generated {len(generated_short_urls)} short URLs in batch"
+            "Successfully generated %d short URLs in batch",
+            len(generated_short_urls),
         )
         return generated_short_urls
 
-    except InvalidRequest as e:
-        logger.error(f"Batch insert failed: {e}")
-        raise e
-    except (ResponseError, TimeoutError) as e:
-        logger.error(f"Redis operation failed: {e}")
-        raise e
+    except (InvalidRequest, ResponseError, TimeoutError, ValueError) as e:
+        logger.error("URL generation failed: %s", e)
+        raise
 
 
 async def generate_short_url(
-    original_url: str,
+    url_data: CreateURL,
     snowflake_generator: SnowflakeIDGenerator,
     redis_client: redis.Redis,
 ) -> dict:
-    """
-    Generate a single shortened URL for the given original URL.
-
-    This function creates a unique short URL using the Snowflake ID generator
-    and stores the mapping in both Cassandra (for persistence) and Redis (for
-    fast retrieval). The operation uses prepared statements for optimal
-    performance and executes the database insert asynchronously.
-
-    The generated URL follows the format: https://miniurl.com/{unique_id}
-    where unique_id is a Snowflake-generated distributed unique identifier.
+    """Generate a single shortened URL for the given original URL.
 
     Args:
-        original_url (str): The complete URL to be shortened. Must be a valid
-                           HTTP/HTTPS URL.
-        snowflake_generator (SnowflakeIDGenerator): Instance for generating unique
-                                                   distributed IDs across nodes.
-        redis_client (redis.Redis): Async Redis client for caching the URL mapping.
+        url_data: Data for the URL to be shortened.
+        snowflake_generator: Instance for generating unique distributed IDs.
+        redis_client: Async Redis client for caching operations.
 
     Returns:
-        dict: A dictionary containing both the original URL and the generated
-              short URL in the format:
-              {
-                  "original_url": "https://example.com",
-                  "short_url": "https://miniurl.com/{unique_id}"
-              }
-
-    Raises:
-        InvalidRequest: If the Cassandra insert fails due to invalid data,
-                       constraint violations, or database connectivity issues.
-        ResponseError: If Redis operations fail due to server-side errors
-                      or memory constraints.
-        TimeoutError: If Redis operations exceed the configured timeout period.
-
-    Example:
-        >>> result = await generate_short_url("https://example.com", generator, redis_client)
-        >>> # Returns: {"original_url": "https://example.com", "short_url": "https://miniurl.com/123"}
+        A dictionary containing the original URL and the generated short URL.
     """
-    try:
-        session: Session = connection.get_session()
+    session: Session = connection.get_session()
+    now_s, _ = await redis_client.time()
+    now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
 
-        # Use prepared statement for better performance
+    try:
+        expiry_date = url_data.expiry_date
+        start_date = url_data.start_date
+
+        if url_data.slug:
+            key = await _handle_slug_creation(
+                url_data.slug, expiry_date, redis_client, session
+            )
+        else:
+            key = str(snowflake_generator.generate_id())
+
         query = session.prepare(
             """
-            INSERT INTO url (short_url, original_url)
-            VALUES (?, ?)
+            INSERT INTO url (short_url, original_url, expiry_date, start_date)
+            VALUES (?, ?, ?, ?)
             """
         )
+        session.execute_async(
+            query,
+            [key, url_data.original_url, expiry_date, start_date],
+        )
 
-        # Generate unique Snowflake ID
-        unique_id = str(snowflake_generator.generate_id())
-
-        # Execute database insert asynchronously
-        session.execute_async(query, [unique_id, original_url])
-
-        # Cache in Redis with 24-hour expiration for fast retrieval
-        await redis_client.set(unique_id, original_url, ex=60 * 60 * 24)
-
-        logger.info(f"Successfully generated short URL for: {original_url}")
-
-        return {
-            "original_url": original_url,
-            "short_url": f"{settings.DOMAIN}/{unique_id}",
+        short_url = f"{settings.DOMAIN}/{key}"
+        result_data = {
+            "original_url": url_data.original_url,
+            "short_url": short_url,
+            "expiry_date": str(expiry_date),
+            "start_date": str(start_date),
         }
 
-    except InvalidRequest as e:
-        logger.error(f"Short URL generation failed: {e}")
-        raise e
-    except (ResponseError, TimeoutError) as e:
-        logger.error(f"Redis operation failed: {e}")
-        raise e
+        await _cache_url_mapping(key, result_data, expiry_date, redis_client)
+        logger.info(
+            "Successfully generated short URL for: %s", url_data.original_url
+        )
+        return result_data
+
+    except (InvalidRequest, ResponseError, TimeoutError, ValueError) as e:
+        logger.error("Short URL generation failed: %s", e)
+        raise
 
 
-async def read_original_url_by_id(id: str, redis_client: redis.Redis) -> str:
-    """
-    Retrieve the original URL for a given shortened URL identifier.
+def _is_expired(now: datetime, expiry_date: datetime) -> bool:
+    """Check if the given expiry date is in the past."""
+    return now > expiry_date
 
-    This function implements a two-tier lookup strategy optimized for performance:
-    1. First checks Redis cache for immediate retrieval
-    2. Falls back to Cassandra database if not found in cache
-    3. Updates Redis cache with retrieved data for future requests
 
-    The caching strategy reduces database load and provides sub-millisecond
-    response times for frequently accessed URLs. The function handles cache
-    misses gracefully and ensures data consistency between storage layers.
+def _is_started(now: datetime, start_date: datetime) -> bool:
+    """Check if the given start date is in the past."""
+    return now >= start_date
+
+
+async def _validate_url_access(
+    now: datetime, expiry_date: str, start_date: str, short_id: str
+):
+    """Validate if the URL is active and not expired."""
+    expiry = datetime.fromisoformat(expiry_date)
+    start = datetime.fromisoformat(start_date)
+
+    if _is_expired(now, expiry):
+        logger.error("URL ID %s has expired.", short_id)
+        raise ExpiredEntryError(f"URL ID {short_id} has expired.")
+
+    if not _is_started(now, start):
+        logger.error("URL ID %s has not started yet.", short_id)
+        raise LinkNotActiveYetError(f"URL ID {short_id} has not started yet.")
+
+
+async def read_original_url_by_id(
+    short_id: str, redis_client: redis.Redis
+) -> Optional[str]:
+    """Retrieve the original URL for a given shortened URL identifier.
 
     Args:
-        id (str): The unique Snowflake ID of the shortened URL to resolve.
-                 This should be the path segment extracted from the short URL.
-        redis_client (redis.Redis): Async Redis client for cache operations.
+        short_id: The unique identifier of the shortened URL.
+        redis_client: Async Redis client for cache operations.
 
     Returns:
-        str: The original URL corresponding to the provided short URL ID.
-             Returns the complete URL ready for redirect operations.
-
-    Raises:
-        InvalidRequest: If the Cassandra query fails due to invalid ID format,
-                       database connectivity issues, or query execution errors.
-        ResponseError: If Redis operations fail due to server errors, memory
-                      issues, or connection problems.
-        TimeoutError: If Redis operations exceed the configured timeout period.
-
-    Example:
-        >>> original = await read_original_url_by_id("123456789", redis_client)
-        >>> # Returns: "https://example.com"
-
-    Note:
-        If the URL is found in Redis cache, the function returns immediately.
-        If not cached, it queries Cassandra and updates the Redis cache for
-        future requests with the same 24-hour TTL used during creation.
+        The original URL, or None if not found.
     """
     try:
-        # Check Redis cache first for fast retrieval
-        original_url = await redis_client.get(id)
-        if original_url:
-            logger.debug(f"Cache hit for URL ID: {id}")
-            return original_url
+        now_s, _ = await redis_client.time()
+        now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
 
-        # Cache miss - query Cassandra database
-        logger.debug(f"Cache miss for URL ID: {id}, querying database")
+        cached_data = await redis_client.hgetall(short_id)
+        if cached_data:
+            logger.debug("Cache hit for URL ID: %s", short_id)
+            await _validate_url_access(
+                now,
+                cached_data["expiry_date"],
+                cached_data["start_date"],
+                short_id,
+            )
+            return cached_data["original_url"]
+
+        logger.debug("Cache miss for URL ID: %s, querying database", short_id)
         session: Session = connection.get_session()
-
-        # Use prepared statement for consistent performance
         query = session.prepare("SELECT * FROM url WHERE short_url=?")
-        future = session.execute_async(query, [id])
+        future = session.execute_async(query, [short_id])
         rows = future.result()
 
         if not rows:
-            logger.warning(f"URL ID not found in database: {id}")
+            logger.warning("URL ID not found in database: %s", short_id)
             return None
 
-        original_url = rows[0]["original_url"]
+        db_data = rows[0]
+        await _validate_url_access(
+            now,
+            str(db_data["expiry_date"]),
+            str(db_data["start_date"]),
+            short_id,
+        )
 
-        # Update Redis cache for future requests (24-hour TTL)
-        await redis_client.set(id, original_url, ex=60 * 60 * 24)
-
-        logger.info(f"Successfully retrieved and cached URL for ID: {id}")
+        original_url = db_data["original_url"]
+        await _cache_url_mapping(
+            short_id,
+            {
+                "original_url": original_url,
+                "short_url": f"{settings.DOMAIN}/{short_id}",
+                "expiry_date": str(db_data["expiry_date"]),
+                "start_date": str(db_data["start_date"]),
+            },
+            db_data["expiry_date"],
+            redis_client,
+        )
+        logger.info("Successfully retrieved and cached URL for ID: %s", short_id)
         return original_url
 
-    except InvalidRequest as e:
-        logger.error(f"Failed to read original URL for ID {id}: {e}")
-        raise e
-    except (ResponseError, TimeoutError) as e:
-        logger.error(f"Redis operation failed for ID {id}: {e}")
-        raise e
+    except (InvalidRequest, ResponseError, TimeoutError) as e:
+        logger.error("Failed to read original URL for ID %s: %s", short_id, e)
+        raise
+    except (ExpiredEntryError, LinkNotActiveYetError) as e:
+        logger.error("Access error for URL ID %s: %s", short_id, e)
+        raise

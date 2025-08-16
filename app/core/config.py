@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     ENV: str
     NODE_ID: int
     EPOCH: int
+    DEFAULT_EXPIRY_DURATION: int
     DOMAIN: str
     GLOBAL_BUCKET_NAME: str
     GLOBAL_BUCKET_CAPACITY: int
