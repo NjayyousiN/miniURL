@@ -78,46 +78,13 @@ logger = setup_logger()
 
 
 class URL(Model):
-    """
-    Cassandra model representing a shortened URL mapping in the miniURL application.
+    """Cassandra model representing a shortened URL mapping in the miniURL application.
 
     This model defines the database schema for storing URL mappings with metadata.
     It uses Cassandra's CQL Engine ORM for type-safe database operations and
     automatic query generation. The model is optimized for read-heavy workloads
     typical in URL shortening services.
 
-    Schema Design:
-        - Primary key on short_url for fast lookups during redirect operations
-        - UUID field for additional unique identification and potential clustering
-        - Text fields with appropriate sizing for URL storage
-        - Automatic timestamp tracking for analytics and debugging
-
-    Attributes:
-        id (UUID): Unique identifier for each URL record. Auto-generated using UUID4
-                   for distributed uniqueness without coordination.
-        original_url (Text): The complete original URL that was shortened. Required field
-                           that stores the destination URL for redirects.
-        short_url (Text): The unique shortened URL identifier (Snowflake ID). Serves as
-                         the primary key for fast lookups during redirect operations.
-        created_at (DateTime): Timestamp when the URL mapping was created. Auto-populated
-                              with current datetime for analytics and debugging.
-
-    Keyspace:
-        Uses the keyspace defined in application settings for multi-tenant support
-        and environment isolation (development/staging/production).
-
-    Performance Considerations:
-        - Primary key on short_url enables single-partition reads
-        - Text columns are efficiently stored in Cassandra's SSTable format
-        - DateTime indexing supports time-based queries for analytics
-        - Model supports both single and batch operations
-
-    Example:
-        >>> url_record = URL.create(
-        ...     short_url="123456789",
-        ...     original_url="https://example.com"
-        ... )
-        >>> # Auto-generates id and created_at fields
     """
 
     __keyspace__ = settings.KEYSPACE
@@ -131,41 +98,12 @@ class URL(Model):
 
 
 class Slug(Model):
-    """
-    Cassandra model representing a slug mapping in the miniURL application.
+    """Cassandra model representing a slug mapping in the miniURL application.
 
     This model defines the database schema for storing slugs associated with URLs.
     It uses Cassandra's CQL Engine ORM for type-safe database operations and
     automatic query generation. The model is optimized for read-heavy workloads
     typical in URL shortening services.
-
-    Schema Design:
-        - Primary key on slug for fast lookups during redirect operations
-        - Text fields with appropriate sizing for slug storage
-        - Automatic timestamp tracking for analytics and debugging
-
-    Attributes:
-        id (UUID): Unique identifier for each slug record. Auto-generated using UUID4
-                   for distributed uniqueness without coordination.
-        slug (Text): The unique slug identifier. Serves as the primary key for fast lookups.
-        created_at (DateTime): Timestamp when the slug mapping was created. Auto-populated
-                              with current datetime for analytics and debugging.
-
-    Keyspace:
-        Uses the keyspace defined in application settings for multi-tenant support
-        and environment isolation (development/staging/production).
-
-    Performance Considerations:
-        - Primary key on slug enables single-partition reads
-        - Text columns are efficiently stored in Cassandra's SSTable format
-        - DateTime indexing supports time-based queries for analytics
-        - Model supports both single and batch operations
-
-    Example:
-        >>> slug_record = Slug.create(
-        ...     slug="example-slug"
-        ... )
-        >>> # Auto-generates id and created_at fields
     """
 
     __keyspace__ = settings.KEYSPACE
@@ -177,8 +115,7 @@ class Slug(Model):
 
 
 def connect_to_db() -> None:
-    """
-    Establish connection to Cassandra database with retry logic and table initialization.
+    """Establishes connection to Cassandra database with retry logic and table initialization.
 
     This function creates a secure connection to DataStax Astra DB using the provided
     secure connect bundle and authentication credentials. It implements robust retry
@@ -210,21 +147,6 @@ def connect_to_db() -> None:
                      persistent connectivity issues that require manual intervention.
         NoHostAvailable: If no Cassandra nodes are reachable (handled and retried).
         ConnectionException: If authentication or configuration issues occur (handled and retried).
-
-    Side Effects:
-        - tSes global CQL Engine session for model operations
-        - Creates/synchronizes URL table schema in the database
-        - Establishes persistent connection pool for application lifetime
-
-    Example:
-        >>> connect_to_db()
-        >>> # Database connection established and tables synchronized
-        >>> # URL model ready for create/read operations
-
-    Note:
-        This function should be called during application startup in the lifespan
-        event handler. The connection persists for the application lifetime and
-        should be properly closed during shutdown.
     """
 
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -260,8 +182,8 @@ def connect_to_db() -> None:
 
             # Create cluster with optimized connection policies
             cluster = Cluster(
-                cloud=cloud_config,
-                auth_provider=auth_provider,
+                cloud=cloud_config if settings.ENV != "dev" else None,
+                auth_provider=auth_provider if settings.ENV != "dev" else None,
                 load_balancing_policy=RoundRobinPolicy(),
                 idle_heartbeat_interval=3,
                 protocol_version=4,
@@ -297,8 +219,7 @@ def connect_to_db() -> None:
 
 
 def connect_to_redis() -> redis.Redis:
-    """
-    Establish connection to Redis server with environment-specific configuration.
+    """Establishes connection to Redis server with environment-specific configuration.
 
     This function creates a global Redis client instance configured for the current
     environment (development or production). It handles different connection
@@ -316,42 +237,9 @@ def connect_to_redis() -> redis.Redis:
             - No authentication (secured by network isolation)
             - Optimized timeout settings for local network
 
-    Connection Features:
-        - Automatic response decoding to string format
-        - Retry logic for timeout scenarios
-        - Health check monitoring every 30 seconds
-        - Configurable socket timeouts for optimal performance
-        - SSL support for secure development environments
-
-    Performance Optimizations:
-        - Connection pooling with keep-alive settings
-        - Automatic retry on timeout for resilience
-        - Health checks to proactively detect connection issues
-        - Optimized socket timeouts based on environment
-
-    Global State:
-        Sets the global `redis_client` variable that can be accessed throughout
-        the application via the `get_redis_client()` function.
-
     Raises:
         ConnectionError: If Redis server is unreachable, authentication fails,
                         or SSL handshake fails in development environment.
-
-    Side Effects:
-        - Modifies global redis_client variable
-        - Establishes persistent Redis connection pool
-        - Configures automatic connection health monitoring
-
-    Example:
-        >>> connect_to_redis()
-        >>> # Redis client configured and ready for operations
-        >>> client = get_redis_client()
-        >>> await client.set("key", "value")
-
-    Note:
-        This function should be called during application startup. The Redis
-        connection persists for the application lifetime and should be properly
-        closed during shutdown using `aclose()`.
     """
     global redis_client
 
@@ -360,16 +248,16 @@ def connect_to_redis() -> redis.Redis:
     try:
         # Determine connection parameters based on environment
         host = (
-            settings.REDIS_HOST_EXTERNAL
+            settings.REDIS_HOST_DEV
             if settings.ENV == "dev"
-            else settings.REDIS_HOST_INTERNAL
+            else settings.REDIS_HOST_PROD
         )
 
-        password = settings.REDIS_PASSWORD if settings.ENV == "dev" else None
+        password = None
 
-        username = settings.REDIS_USERNAME if settings.ENV == "dev" else None
+        username = None
 
-        use_ssl = settings.ENV == "dev"
+        use_ssl = False
 
         logger.info(
             f"Connecting to Redis at {host}:{settings.REDIS_PORT} "
@@ -399,8 +287,7 @@ def connect_to_redis() -> redis.Redis:
 
 
 def get_redis_client() -> redis.Redis:
-    """
-    Retrieve the global Redis client instance for dependency injection.
+    """Retrieves the global Redis client instance for dependency injection.
 
     This function provides access to the Redis client instance that was initialized
     during application startup. It's designed to be used with FastAPI's dependency
@@ -423,23 +310,8 @@ def get_redis_client() -> redis.Redis:
         - FastAPI dependency injection in route handlers
         - Direct access in service classes and utility functions
         - Async context managers for transaction-like operations
-
-    Example:
-        >>> # In FastAPI route handler
-        >>> @app.get("/example")
-        >>> async def example_route(redis: redis.Redis = Depends(get_redis_client)):
-        ...     await redis.set("key", "value")
-
-        >>> # Direct usage in services
-        >>> client = get_redis_client()
-        >>> await client.get("cached_data")
-
-    Note:
-        This function should only be called after successful execution of
-        `connect_to_redis()` during application startup. The returned client
-        is thread-safe and can be used across multiple async operations
-        simultaneously.
     """
+
     if redis_client is None:
         logger.error("Redis client not initialized. Call connect_to_redis() first.")
         raise RuntimeError("Redis client not initialized")

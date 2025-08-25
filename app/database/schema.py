@@ -5,8 +5,16 @@ from pydantic import BaseModel, Field, model_validator
 
 from core.config import settings
 
+
 class URLItem(BaseModel):
-    """Request model for creating a new shortened URL."""
+    """Request model for creating a new shortened URL.
+
+    Args:
+        original_url (str): The original URL to be shortened.
+        slug (Optional[str]): Optional custom slug for the shortened URL.
+        expiry_date (Optional[datetime]): Optional expiry date for the shortened URL.
+        start_date (Optional[datetime]): Optional start date for the shortened URL.
+    """
 
     original_url: str = Field(
         ...,
@@ -71,11 +79,22 @@ class URLItem(BaseModel):
 
 
 class CreateURL(URLItem):
-    """Request model for creating a new shortened URL."""
+    """Request model for creating a new shortened URL.
+
+    Args:
+        original_url (str): The original URL to be shortened.
+        slug (Optional[str]): Optional custom slug for the shortened URL.
+        expiry_date (Optional[datetime]): Optional expiry date for the shortened URL.
+        start_date (Optional[datetime]): Optional start date for the shortened URL.
+    """
 
 
 class CreateURLBatch(BaseModel):
-    """Request model for creating a batch of new shortened URLs."""
+    """Request model for creating a batch of new shortened URLs.
+
+    Args:
+        urls (list[URLItem]): List of URLs to be shortened.
+    """
 
     urls: list[URLItem] = Field(
         ...,

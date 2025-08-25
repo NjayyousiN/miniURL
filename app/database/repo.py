@@ -52,7 +52,11 @@ import redis.asyncio as redis
 from redis.exceptions import ResponseError, TimeoutError
 
 from core.config import settings
-from core.exceptions import ExpiredEntryError, LinkNotActiveYetError, SlugAlreadyExistsError
+from core.exceptions import (
+    ExpiredEntryError,
+    LinkNotActiveYetError,
+    SlugAlreadyExistsError,
+)
 from database import URL
 from database.schema import CreateURL, CreateURLBatch
 from services.logger import setup_logger
@@ -61,25 +65,31 @@ from utils.snowflake import SnowflakeIDGenerator
 logger = setup_logger()
 
 
-async def _generate_alternative_slugs(slug: str, redis_client: redis.Redis, session: Session) -> list[str]:
+async def _generate_alternative_slugs(
+    slug: str, redis_client: redis.Redis, session: Session
+) -> list[str]:
     """Generate alternative slugs for a given slug.
 
     Args:
-        slug: The custom slug to generate alternative slugs for.
+        slug (str): The custom slug to generate alternative slugs for.
+        redis_client (redis.Redis): Async Redis client.
+        session (Session): Cassandra session.
 
     Returns:
-        A list of alternative slugs.
+        list[str]: A list of alternative slugs.
+
+    Raises:
+        SlugAlreadyExistsError: If the slug is already in use.
     """
 
-    alternative_slugs = [
-        slug + str(random.randint(100, 999))
-        for _ in range(6)
-    ]
+    alternative_slugs = [slug + str(random.randint(100, 999)) for _ in range(6)]
     available_slugs = []
     for slug in alternative_slugs:
         if await _is_slug_available(slug, redis_client, session):
             available_slugs.append(slug)
-    raise SlugAlreadyExistsError(f"Slug already exists, try one of these: {available_slugs}") from None
+    raise SlugAlreadyExistsError(
+        f"Slug already exists, try one of these: {available_slugs}"
+    ) from None
 
 
 async def _reserve_slug(
@@ -88,21 +98,33 @@ async def _reserve_slug(
     """Reserve a custom slug in Redis to prevent conflicts.
 
     Args:
-        slug: The custom slug to reserve.
-        expires_at: The expiry date of the slug.
-        redis_client: Async Redis client.
-        session: Cassandra session.
+        slug (str): The custom slug to reserve.
+        expires_at (datetime): The expiry date of the slug.
+        redis_client (redis.Redis): Async Redis client.
+        session (Session): Cassandra session.
 
     Returns:
-        True if the slug was successfully reserved, False otherwise.
+        bool: True if the slug was successfully reserved, False otherwise.
+
+    Raises:
+        ResponseError: If the Redis operation fails.
+        TimeoutError: If the Redis operation times out.
+        InvalidRequest: If the Cassandra operation fails.
     """
     try:
         logger.debug("Reserving slug in Redis: %s", slug)
         query = session.prepare("INSERT INTO slug (slug, expires_at) VALUES (?, ?)")
         session.execute_async(query, [slug, expires_at])
 
+        # Redis expiry time in seconds
+        redis_expiry_time = int(
+            (
+                expires_at - datetime.now(timezone.utc).replace(tzinfo=None)
+            ).total_seconds()
+        )
+
         if await redis_client.setnx(f"slug:{slug}", "reserved"):
-            await redis_client.expire(f"slug:{slug}", 60 * 60 * 24)
+            await redis_client.expire(f"slug:{slug}", redis_expiry_time)
             logger.info("Slug '%s' reserved successfully.", slug)
             return True
         return False
@@ -120,12 +142,17 @@ async def _is_slug_available(
     """Check if a given slug is available for use.
 
     Args:
-        slug: The custom slug to check.
-        redis_client: Async Redis client.
-        session: Cassandra session.
+        slug (str): The custom slug to check.
+        redis_client (redis.Redis): Async Redis client.
+        session (Session): Cassandra session.
 
     Returns:
-        True if the slug is available, False otherwise.
+        bool: True if the slug is available, False otherwise.
+
+    Raises:
+        ResponseError: If the Redis operation fails.
+        TimeoutError: If the Redis operation times out.
+        InvalidRequest: If the Cassandra operation fails.
     """
 
     available = False
@@ -163,14 +190,18 @@ async def _handle_slug_creation(
     """Handle the creation and reservation of a custom slug.
 
     Args:
-        slug: The custom slug to create.
-        expiry_date: The expiry date of the slug.
-        redis_client: Async Redis client.
-        session: Cassandra session.
+        slug (str): The custom slug to create.
+        expiry_date (datetime): The expiry date of the slug.
+        redis_client (redis.Redis): Async Redis client.
+        session (Session): Cassandra session.
 
     Returns:
-        The reserved slug.
+        str: The reserved slug.
+
+    Raises:
+        ValueError: If the slug is already in use.
     """
+
     if not await _is_slug_available(slug, redis_client, session):
         logger.error("Slug '%s' is already in use.", slug)
         raise ValueError(f"Slug '{slug}' is already in use.")
@@ -190,15 +221,17 @@ async def _cache_url_mapping(
     """Cache the URL mapping in Redis.
 
     Args:
-        key: The key to store the mapping under.
-        data: The URL mapping data.
-        expiry_date: The expiry date of the mapping.
-        redis_client: Async Redis client.
+        key (str): The key to store the mapping under.
+        data (dict): The URL mapping data.
+        expiry_date (datetime): The expiry date of the mapping.
+        redis_client (redis.Redis): Async Redis client.
     """
     await redis_client.hset(name=key, mapping=data)
     now_s, _ = await redis_client.time()
     now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
-    await redis_client.expire(key, int((expiry_date - now).total_seconds()))
+    # Redis expiry time in seconds
+    redis_expiry_time = int((expiry_date - now).total_seconds())
+    await redis_client.expire(key, redis_expiry_time)
 
 
 async def generate_short_urls(
@@ -209,17 +242,21 @@ async def generate_short_urls(
     """Generate shortened URLs for multiple original URLs using batch processing.
 
     Args:
-        batch_urls: Batch of URLs to be shortened.
-        snowflake_generator: Instance for generating unique distributed IDs.
-        redis_client: Async Redis client for caching operations.
+        batch_urls (CreateURLBatch): Batch of URLs to be shortened.
+        snowflake_generator (SnowflakeIDGenerator): Instance for generating unique distributed IDs.
+        redis_client (redis.Redis): Async Redis client for caching operations.
 
     Returns:
-        Dictionary mapping generated short URLs to their original URLs.
+        dict: Dictionary mapping generated short URLs to their original URLs.
+
+    Raises:
+        InvalidRequest: If the request is invalid.
+        ResponseError: If the response is invalid.
+        TimeoutError: If the request times out.
+        ValueError: If the URL data is invalid.
     """
     generated_short_urls = {}
     session: Session = connection.get_session()
-    now_s, _ = await redis_client.time()
-    now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
 
     try:
         batch = BatchQuery()
@@ -274,16 +311,20 @@ async def generate_short_url(
     """Generate a single shortened URL for the given original URL.
 
     Args:
-        url_data: Data for the URL to be shortened.
-        snowflake_generator: Instance for generating unique distributed IDs.
-        redis_client: Async Redis client for caching operations.
+        url_data (CreateURL): Data for the URL to be shortened.
+        snowflake_generator (SnowflakeIDGenerator): Instance for generating unique distributed IDs.
+        redis_client (redis.Redis): Async Redis client for caching operations.
 
     Returns:
-        A dictionary containing the original URL and the generated short URL.
+        dict: A dictionary containing the original URL and the generated short URL.
+
+    Raises:
+        InvalidRequest: If the request is invalid.
+        ResponseError: If the response is invalid.
+        TimeoutError: If the request times out.
+        ValueError: If the URL data is invalid.
     """
     session: Session = connection.get_session()
-    now_s, _ = await redis_client.time()
-    now = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(tzinfo=None)
 
     try:
         expiry_date = url_data.expiry_date
@@ -316,9 +357,7 @@ async def generate_short_url(
         }
 
         await _cache_url_mapping(key, result_data, expiry_date, redis_client)
-        logger.info(
-            "Successfully generated short URL for: %s", url_data.original_url
-        )
+        logger.info("Successfully generated short URL for: %s", url_data.original_url)
         return result_data
 
     except (InvalidRequest, ResponseError, TimeoutError, ValueError) as e:
@@ -358,11 +397,18 @@ async def read_original_url_by_id(
     """Retrieve the original URL for a given shortened URL identifier.
 
     Args:
-        short_id: The unique identifier of the shortened URL.
-        redis_client: Async Redis client for cache operations.
+        short_id (str): The unique identifier of the shortened URL.
+        redis_client (redis.Redis): Async Redis client for cache operations.
 
     Returns:
         The original URL, or None if not found.
+
+    Raises:
+        ExpiredEntryError: If the URL has expired.
+        LinkNotActiveYetError: If the URL has not started yet.
+        InvalidRequest: If the request is invalid.
+        ResponseError: If the response is invalid.
+        TimeoutError: If the request times out.
     """
     try:
         now_s, _ = await redis_client.time()
@@ -380,6 +426,7 @@ async def read_original_url_by_id(
             return cached_data["original_url"]
 
         logger.debug("Cache miss for URL ID: %s, querying database", short_id)
+
         session: Session = connection.get_session()
         query = session.prepare("SELECT * FROM url WHERE short_url=?")
         future = session.execute_async(query, [short_id])

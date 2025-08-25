@@ -16,10 +16,8 @@ class Settings(BaseSettings):
     IP_BUCKET_REFILL_RATE: int
     IP_BUCKET_REFILL_INTERVAL: int
     KEYSPACE: str
-    REDIS_PASSWORD: str
-    REDIS_USERNAME: str
-    REDIS_HOST_EXTERNAL: str
-    REDIS_HOST_INTERNAL: str
+    REDIS_HOST_DEV: str
+    REDIS_HOST_PROD: str
     REDIS_PORT: int
     CASSANDRA_HOST: str
     CASSANDRA_CLIENT_ID: str
