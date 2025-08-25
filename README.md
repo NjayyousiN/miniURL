@@ -2,7 +2,7 @@
 
 A high-performance URL shortening service built with FastAPI, Cassandra, and Redis. Transform long URLs into short, shareable links with advanced features like expiration dates, custom slugs, and comprehensive rate limiting.
 
-**Live Demo:** [https://miniurl-wmmw.onrender.com/](https://miniurl-wmmw.onrender.com/)
+**Live Demo:** [https://miniurl-wmmw.onrender.com/docs](https://miniurl-wmmw.onrender.com/docs)
 
 ## Features
 
