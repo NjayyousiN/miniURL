@@ -79,7 +79,7 @@ A high-performance URL shortening service built with FastAPI, Cassandra, and Red
    uvicorn main:app --reload --host 0.0.0.0 --port 8000
    ```
 
-## 📡 API Endpoints
+## API Endpoints
 
 ### Create Short URL
 
@@ -121,7 +121,7 @@ GET /{short_id}
 
 Returns a 307 redirect to the original URL.
 
-## ⚡ Rate Limiting
+## Rate Limiting
 
 The service implements a sophisticated two-tier rate limiting system:
 
